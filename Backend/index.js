@@ -5,8 +5,8 @@ import bodyParser from "body-parser"
 import cors from "cors"
 import dotenv from "dotenv"
 import { Buffer } from "buffer"
+import crypto from "crypto"
 dotenv.config()
-import { requireAuth } from "./middleware/requireAuth.js"
 import { v4 as uuidv4 } from "uuid"
 import cookieParser from "cookie-parser"
 
@@ -31,10 +31,70 @@ const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY
 const GOOGLE_API_KEY = process.env.GOOGLE_SEARCH_API_KEY
 const GOOGLE_CSE_ID = process.env.GOOGLE_SEARCH_ENGINE_ID
 
-// Simple In-Memory Store
-let storedAccessToken = null
-let storedRefreshToken = null
-let tokenExpiryTime = 0
+const IS_PROD = process.env.NODE_ENV === "production"
+const SPOTIFY_AUTH_COOKIE = "zonic_spotify"
+const SPOTIFY_STATE_COOKIE = "spotify_auth_state"
+const SESSION_KEY_SECRET =
+  process.env.SPOTIFY_SESSION_SECRET || process.env.SESSION_SECRET || process.env.SPOTIFY_CLIENT_SECRET
+
+function getSpotifyCookieOptions(maxAgeMs) {
+  return {
+    httpOnly: true,
+    secure: IS_PROD,
+    sameSite: "Lax",
+    path: "/",
+    ...(typeof maxAgeMs === "number" ? { maxAge: maxAgeMs } : {}),
+  }
+}
+
+function getSpotifySessionKey() {
+  if (!SESSION_KEY_SECRET) throw new Error("Missing SPOTIFY_SESSION_SECRET (or SESSION_SECRET)")
+  return crypto.createHash("sha256").update(SESSION_KEY_SECRET).digest()
+}
+
+function encryptSpotifySession(session) {
+  const key = getSpotifySessionKey()
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv)
+  const plaintext = Buffer.from(JSON.stringify(session), "utf8")
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()])
+  const tag = cipher.getAuthTag()
+
+  return `${iv.toString("base64url")}.${tag.toString("base64url")}.${ciphertext.toString("base64url")}`
+}
+
+function decryptSpotifySession(payload) {
+  try {
+    if (!payload || typeof payload !== "string") return null
+    const [ivB64, tagB64, dataB64] = payload.split(".")
+    if (!ivB64 || !tagB64 || !dataB64) return null
+
+    const key = getSpotifySessionKey()
+    const iv = Buffer.from(ivB64, "base64url")
+    const tag = Buffer.from(tagB64, "base64url")
+    const data = Buffer.from(dataB64, "base64url")
+
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv)
+    decipher.setAuthTag(tag)
+    const plaintext = Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8")
+    return JSON.parse(plaintext)
+  } catch {
+    return null
+  }
+}
+
+function requireSpotifyCookieAuth(req, res, next) {
+  const session = decryptSpotifySession(req.cookies?.[SPOTIFY_AUTH_COOKIE])
+  if (!session?.access_token) {
+    return res.status(401).json({ error: "Not authenticated with Spotify" })
+  }
+  if (session.expires_at && Date.now() >= session.expires_at) {
+    return res.status(401).json({ error: "Spotify session expired" })
+  }
+  req.token = session.access_token
+  req.spotifySession = session
+  next()
+}
 
 app.get("/", (req, res) => {
   res.send("Welcome to the Zonic backend!")
@@ -42,7 +102,7 @@ app.get("/", (req, res) => {
 
 app.get("/login", (req, res) => {
   const state = uuidv4() //Secure random UUID like "550e8400-e29b-41d4-a716-446655440000" as Spotify requires a state parameter to prevent CSRF attacks.
-  res.cookie("spotify_auth_state", state, { httpOnly: true, secure: true, sameSite: "Lax" })
+  res.cookie(SPOTIFY_STATE_COOKIE, state, { httpOnly: true, secure: IS_PROD, sameSite: "Lax" })
   const scope = [
     "user-read-private",
     "user-read-email",
@@ -68,7 +128,7 @@ app.get("/callback", async (req, res) => {
   const code = req.query.code || null
   const state = req.query.state || null
   //Verify received state matches the stored state
-  const storedState = req.cookies.spotify_auth_state
+  const storedState = req.cookies[SPOTIFY_STATE_COOKIE]
 
   if (state === null || state != storedState) {
     return res.redirect(`${frontend_uri}/#${querystring.stringify({ error: "state mismatch" })}`)
@@ -91,19 +151,17 @@ app.get("/callback", async (req, res) => {
       },
     )
 
-    storedAccessToken = tokenResponse.data.access_token //stores access token sent by spotify
-    storedRefreshToken = tokenResponse.data.refresh_token // stores refresh token
-    tokenExpiryTime = Date.now() + tokenResponse.data.expires_in * 1000 // 1 hr expiry time
+    const expiresInMs = tokenResponse.data.expires_in * 1000
+    const session = {
+      access_token: tokenResponse.data.access_token,
+      refresh_token: tokenResponse.data.refresh_token,
+      expires_at: Date.now() + expiresInMs,
+    }
 
-    console.log("tokens obtained")
+    res.clearCookie(SPOTIFY_STATE_COOKIE)
+    res.cookie(SPOTIFY_AUTH_COOKIE, encryptSpotifySession(session), getSpotifyCookieOptions(expiresInMs))
 
-    // Redirect back to frontend with tokens in hash
-    res.redirect(
-      `${frontend_uri}/#${querystring.stringify({
-        access_token: storedAccessToken,
-        expires_in: tokenResponse.data.expires_in,
-      })}`,
-    ) // http://localhost:5173/#access_token=BQAx...&expires_in=3600
+    res.redirect(`${frontend_uri}/#${querystring.stringify({ auth: "success" })}`)
   } catch (error) {
     console.error("Error exchanging code for token:", error.response ? error.response.data : error.message)
     res.redirect(`${frontend_uri}/#${querystring.stringify({ error: "invalid token" })}`)
@@ -112,12 +170,12 @@ app.get("/callback", async (req, res) => {
 
 app.post("/refresh_token", async (req, res) => {
   //refresh the user's access token when it expires using a refresh token without needing the user to log in again.
-  const { refresh_token } = req.body
-  if (!refresh_token && !storedRefreshToken) {
-    // Check body first, then internal store
-    return res.status(400).json({ error: "Refresh token not provided and not stored" })
+  const tokenFromBody = req.body?.refresh_token
+  const session = decryptSpotifySession(req.cookies?.[SPOTIFY_AUTH_COOKIE])
+  const tokenToUse = tokenFromBody || session?.refresh_token
+  if (!tokenToUse) {
+    return res.status(400).json({ error: "Refresh token not provided" })
   }
-  const tokenToUse = refresh_token || storedRefreshToken
 
   try {
     const refreshResponse = await axios.post(
@@ -133,13 +191,13 @@ app.post("/refresh_token", async (req, res) => {
         },
       },
     )
-
-    // Update internal store if internal token was refreshed
-    if (!refresh_token) {
-      storedAccessToken = refreshResponse.data.access_token
-      tokenExpiryTime = Date.now() + refreshResponse.data.expires_in * 1000
-      console.log("Spotify token refreshed")
+    const expiresInMs = refreshResponse.data.expires_in * 1000
+    const nextSession = {
+      access_token: refreshResponse.data.access_token,
+      refresh_token: tokenToUse,
+      expires_at: Date.now() + expiresInMs,
     }
+    res.cookie(SPOTIFY_AUTH_COOKIE, encryptSpotifySession(nextSession), getSpotifyCookieOptions(expiresInMs))
 
     res.json({
       access_token: refreshResponse.data.access_token,
@@ -147,17 +205,13 @@ app.post("/refresh_token", async (req, res) => {
     })
   } catch (error) {
     console.error("Error refreshing token:", error.response ? error.response.data : error.message)
-    // Clear internal tokens on failure if they were being used?
-    if (!refresh_token) {
-      storedAccessToken = null
-      tokenExpiryTime = 0
-    }
+    res.clearCookie(SPOTIFY_AUTH_COOKIE, { path: "/" })
     res.status(error.response?.status || 500).json({ error: "Failed to refresh token" })
   }
 })
 
 // Apply auth middleware to Spotify proxy routes
-app.get("/user", requireAuth, async (req, res) => {
+app.get("/user", requireSpotifyCookieAuth, async (req, res) => {
   try {
     const response = await axios.get("https://api.spotify.com/v1/me", {
       //user info
@@ -172,7 +226,7 @@ app.get("/user", requireAuth, async (req, res) => {
   }
 })
 
-app.get("/playlists", requireAuth, async (req, res) => {
+app.get("/playlists", requireSpotifyCookieAuth, async (req, res) => {
   try {
     const limit = req.query.limit || 20
     const response = await axios.get("https://api.spotify.com/v1/me/playlists", {
@@ -189,7 +243,7 @@ app.get("/playlists", requireAuth, async (req, res) => {
   }
 })
 
-app.get("/liked-songs", requireAuth, async (req, res) => {
+app.get("/liked-songs", requireSpotifyCookieAuth, async (req, res) => {
   try {
     const limit = req.query.limit || 20
     const offset = req.query.offset || 0
@@ -207,7 +261,7 @@ app.get("/liked-songs", requireAuth, async (req, res) => {
   }
 })
 
-app.get("/top-tracks", requireAuth, async (req, res) => {
+app.get("/top-tracks", requireSpotifyCookieAuth, async (req, res) => {
   try {
     const limit = req.query.limit || 20
     const offset = req.query.offset || 0
@@ -227,7 +281,7 @@ app.get("/top-tracks", requireAuth, async (req, res) => {
 })
 
 // NEW ENDPOINT: Search Tracks
-app.get("/search", requireAuth, async (req, res) => {
+app.get("/search", requireSpotifyCookieAuth, async (req, res) => {
   try {
     const q = req.query.q
     const limit = req.query.limit || 20
@@ -270,7 +324,7 @@ app.get("/search", requireAuth, async (req, res) => {
 })
 
 // NEW ENDPOINT: Get Playlist Tracks
-app.get("/playlists/:playlistId/tracks", requireAuth, async (req, res) => {
+app.get("/playlists/:playlistId/tracks", requireSpotifyCookieAuth, async (req, res) => {
   try {
     const { playlistId } = req.params
     const limit = req.query.limit || 50
